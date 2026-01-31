@@ -33,6 +33,7 @@ export default {
               if (quoteState.buffer === "" || quoteState.buffer === undefined) {
                 if (post) {
                   if (
+                    post.post_number !== 1 &&
                     topic.highest_post_number + 1 - post.post_number >
                     settings.quick_quote_post_location_threshold
                   ) {
@@ -65,28 +66,23 @@ export default {
                           quotedText.length
                         );
                     }
+                    quotedText = quotedText.replace(/<[^>]*>/g, ""); // 始终移除所有 HTML 标签
                     if (settings.quick_quote_character_limit) {
-                      if (
-                        quotedText.length > settings.quick_quote_character_limit
-                      ) {
-                        quotedText = quotedText.replace(/<[^>]*>/g, ""); // remove tags because you are splitting text so can't guarantee where
-                        startOfExcerpt =
-                          quotedText.length -
-                            lengthOfEndQuoteTag -
-                            settings.quick_quote_character_limit <
-                          startOfQuoteText
-                            ? startOfQuoteText
-                            : quotedText.length -
-                              settings.quick_quote_character_limit -
-                              lengthOfEndQuoteTag -
-                              2;
+                      const contentStart = startOfQuoteText;
+                      const contentEnd = quotedText.length - lengthOfEndQuoteTag;
+                      const actualContentLength = contentEnd - contentStart;
+
+                      if (actualContentLength > settings.quick_quote_character_limit) {
+                        const excerpt = quotedText.substring(
+                          contentStart,
+                          contentStart + settings.quick_quote_character_limit
+                        );
+
                         quotedText =
-                          quotedText.substring(0, startOfQuoteText) +
+                          quotedText.substring(0, contentStart) +
+                          excerpt +
                           "..." +
-                          quotedText.substring(
-                            startOfExcerpt,
-                            quotedText.length
-                          );
+                          quotedText.substring(contentEnd);
                       }
                     }
                   }

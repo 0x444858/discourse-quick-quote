@@ -1,25 +1,30 @@
 quick_quote_post_location_threshold:
   type: integer
-  default: 3
+  default: 0
   description:
     en: "Number of posts back before fast quote enabled."
+    zh_CN: "距离最新帖子多少层以内时，快速引用功能将被禁用（设为 0 表示始终启用）。"
 quick_quote_remove_links:
   type: bool
   default: true
   description:
     en: "Remove all links (inc. pictures) from quotes"
+    zh_CN: "从引用内容中移除所有链接（包括图片）"
 quick_quote_remove_prior_quotes:
   type: bool
   default: true
   description:
     en: "Remove all prior (nested) quotes"
+    zh_CN: "移除所有先前的（嵌套）引用内容"
 quick_quote_remove_contiguous_new_lines:
   type: bool
   default: true
   description:
     en: "Remove unnecessary new lines"
+    zh_CN: "移除多余的连续空行"
 quick_quote_character_limit:
   type: integer
-  default: 400
+  default: 50
   description:
-    en: "Quote character limit (uses last x chars if total length is greater)"
+    en: "Quote character limit (uses first x chars if total length is greater)"
+    zh_CN: "引用内容字符数限制（超过使用开头的 x 个字符）"
