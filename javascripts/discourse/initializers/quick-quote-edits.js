@@ -39,28 +39,31 @@ export default {
                   ) {
                     quotedText = buildQuote(post, post.cooked);
 
+                    quotedText = quotedText.replace( // 始终去除嵌套引用
+                      /<aside[\s\S]*<\/aside>/g,
+                      ""
+                    );
+
                     if (settings.quick_quote_save_link_text) {
                       quotedText = quotedText.replace(/<a\b[^>]*>(.*?)<\/a>/gi, " $1 ");
                     }
                     const startOfQuoteText = quotedText.indexOf("]") + 2; // not forgetting the new line char
                     const lengthOfEndQuoteTag = 11; // [/quote] and newline preceeding
-                    let startOfExcerpt = startOfQuoteText;
-                    let excerpt = "";
-                    if (settings.quick_quote_remove_contiguous_new_lines) {
-                      excerpt = quotedText.substring(
-                        startOfExcerpt,
-                        quotedText.length - lengthOfEndQuoteTag
-                      );
-                      excerpt = excerpt.replace(/\n*\n/g, "");
+                    
+                    const contentStart = startOfQuoteText;
+                    const contentEnd = quotedText.length - lengthOfEndQuoteTag;
+
+                    if (contentEnd > contentStart) {
+                      let content = quotedText.substring(contentStart, contentEnd);
+                      content = content.replace(/<[^>]*>/g, " "); // 移除所有 HTML 标签
+                      content = content.replace(/\s+/g, " ");
+                      content = content.trim();
                       quotedText =
-                        quotedText.substring(0, startOfQuoteText) +
-                        excerpt +
-                        quotedText.substring(
-                          quotedText.length - lengthOfEndQuoteTag,
-                          quotedText.length
-                        );
+                        quotedText.substring(0, contentStart) +
+                        content +
+                        quotedText.substring(contentEnd);
                     }
-                    quotedText = quotedText.replace(/<[^>]*>/g, " "); // 始终移除所有 HTML 标签
+
                     if (settings.quick_quote_character_limit) {
                       const contentStart = startOfQuoteText;
                       const contentEnd = quotedText.length - lengthOfEndQuoteTag;
