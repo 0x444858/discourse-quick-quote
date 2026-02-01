@@ -66,7 +66,7 @@ export default {
                           quotedText.length
                         );
                     }
-                    quotedText = quotedText.replace(/<[^>]*>/g, ""); // 始终移除所有 HTML 标签
+                    quotedText = quotedText.replace(/<[^>]*>/g, " "); // 始终移除所有 HTML 标签
                     if (settings.quick_quote_character_limit) {
                       const contentStart = startOfQuoteText;
                       const contentEnd = quotedText.length - lengthOfEndQuoteTag;
