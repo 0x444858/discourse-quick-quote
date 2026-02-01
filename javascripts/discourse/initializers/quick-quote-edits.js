@@ -39,8 +39,8 @@ export default {
                   ) {
                     quotedText = buildQuote(post, post.cooked);
 
-                    if (settings.quick_quote_remove_links) {
-                      quotedText = quotedText.replace(/<a[\s\S]*?<\/a>/g, "");
+                    if (settings.quick_quote_save_link_text) {
+                      quotedText = quotedText.replace(/<a\b[^>]*>(.*?)<\/a>/gi, " $1 ");
                     }
                     const startOfQuoteText = quotedText.indexOf("]") + 2; // not forgetting the new line char
                     const lengthOfEndQuoteTag = 11; // [/quote] and newline preceeding
