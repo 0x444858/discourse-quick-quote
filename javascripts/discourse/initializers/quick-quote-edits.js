@@ -39,12 +39,6 @@ export default {
                   ) {
                     quotedText = buildQuote(post, post.cooked);
 
-                    if (settings.quick_quote_remove_prior_quotes) {
-                      quotedText = quotedText.replace(
-                        /<aside[\s\S]*<\/aside>/g,
-                        ""
-                      );
-                    }
                     if (settings.quick_quote_remove_links) {
                       quotedText = quotedText.replace(/<a[\s\S]*?<\/a>/g, "");
                     }
