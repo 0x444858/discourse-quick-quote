@@ -4,15 +4,27 @@ quick_quote_post_location_threshold:
   description:
     en: "Number of posts back before fast quote enabled."
     zh_CN: "距离最新帖子多少层以内时，快速引用功能将被禁用（设为 0 表示始终启用）。"
-quick_quote_save_link_text:
-  type: bool
-  default: true
-  description:
-    en: "Keep link text. If disabled, the link will be completely removed."
-    zh_CN: "保留链接文字。若禁用，链接将完全移除"
 quick_quote_character_limit:
   type: integer
-  default: 50
+  default: 100
   description:
     en: "Quote character limit (uses first x chars if total length is greater)"
     zh_CN: "引用内容字符数限制（超过使用开头的 x 个字符）"
+quick_quote_keep_link_reachable:
+  type: bool
+  default: true
+  description:
+    en: "When truncating, only truncate link display text, keeping the URL intact so links remain clickable."
+    zh_CN: "截断时仅截断链接的显示文字，保留完整 URL，确保截断后的链接仍然可点击。"
+quick_quote_truncate_bare_links:
+  type: bool
+  default: false
+  description:
+    en: "Proactively truncate bare URL links (where display text equals href) after the first path segment."
+    zh_CN: "主动截断裸链接（显示文字与 URL 相同的链接），仅保留第一个路径段。"
+quick_quote_double_width_unicode:
+  type: bool
+  default: true
+  description:
+    en: "Count non-ASCII characters as double-width when truncating, so mixed-language text has a consistent visual cut point."
+    zh_CN: "截断时将非 ASCII 字符计为 2 倍宽度，使中英文混排时截断后的视觉长度更加接近。"
