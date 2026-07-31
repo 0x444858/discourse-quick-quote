@@ -131,6 +131,19 @@ function extractImageTitle(fullATag, innerHtml) {
   return "image";
 }
 
+/**
+ * Extract the src attribute from the first <img> tag inside a link's inner HTML.
+ * For lightbox images this is the thumbnail URL, as opposed to the <a> href
+ * which points to the original.
+ *
+ * @param {string} innerHtml
+ * @returns {string|null}
+ */
+function extractImgSrc(innerHtml) {
+  const srcMatch = /<img[^>]*src="([^"]*)"[^>]*>/i.exec(innerHtml);
+  return srcMatch ? srcMatch[1] : null;
+}
+
 // ── Visual-width helpers (double-width Unicode) ───────────────────────────
 
 /*
@@ -181,7 +194,7 @@ function sliceByVisualWidth(text, maxWidth) {
  *
  * @returns {{ prefix: string, suffix: string, segments: (TextSegment|LinkSegment)[] }}
  */
-function parseHtmlToSegments(bbcodeString, keepImage) {
+function parseHtmlToSegments(bbcodeString, keepImage, useThumbnail) {
   const contentStart = bbcodeString.indexOf("]\n") + 2;
   const contentEnd = bbcodeString.length - 11; // "\n[/quote]".length
 
@@ -209,11 +222,15 @@ function parseHtmlToSegments(bbcodeString, keepImage) {
 
     if (keepImage && linkContainsNonEmojiImage(innerHtml)) {
       // Image wrapped in a link (lightbox / onebox / manual) —
-      // preserve as a structured image so it can be output as ![title](url)
+      // preserve as a structured image so it can be output as ![title](url).
+      // When useThumbnail is on, prefer the <img src> (thumbnail) over the
+      // <a href> (original); otherwise keep the original.
+      const imgSrc = useThumbnail ? extractImgSrc(innerHtml) : null;
+      const imageHref = imgSrc || href;
       segments.push({
         type: "link",
         text: extractImageTitle(match[0], innerHtml),
-        href,
+        href: imageHref,
         isBareLink: false,
         isImage: true,
       });
@@ -429,7 +446,8 @@ function processQuoteWithSegments(bbcodeString, settings) {
   // Parse into structured segments (links are always preserved as objects)
   let { prefix, suffix, segments } = parseHtmlToSegments(
     text,
-    settings.quick_quote_keep_image
+    settings.quick_quote_keep_image,
+    settings.quick_quote_image_use_thumbnail
   );
 
   const doubleWidth = settings.quick_quote_double_width_unicode;
