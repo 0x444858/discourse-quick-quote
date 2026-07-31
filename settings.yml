@@ -40,9 +40,3 @@ quick_quote_image_character_width:
   description:
     en: "Fixed number of characters an image occupies in the quote character budget. Images are kept whole or dropped entirely — no partial truncation."
     zh_CN: "图片在引用字符限制中占用的固定宽度。图片要么完整保留，要么被整体丢弃——不会有部分截断。"
-quick_quote_image_use_thumbnail:
-  type: bool
-  default: true
-  description:
-    en: "Use the thumbnail URL (img src) for lightbox images instead of the original image URL (a href)."
-    zh_CN: "用户上传的图片使用缩略图地址（img src）而非原图地址（a href）。"

@@ -70,11 +70,12 @@ function parseInlineContent(html, keepImage) {
       const altMatch = /alt="([^"]*)"[^>]*/i.exec(tag);
       segments.push({ type: "emoji", text: altMatch ? altMatch[1] : "" });
     } else if (keepImage) {
-      // Standalone <img> not wrapped in <a> — preserve as image
+      // Standalone <img> not wrapped in <a> — preserve as image.
+      // Prefer the short upload:// URL when available.
       const altMatch = /alt="([^"]*)"[^>]*/i.exec(tag);
       const srcMatch = /src="([^"]*)"[^>]*/i.exec(tag);
       const alt = altMatch?.[1]?.trim() || "image";
-      const src = srcMatch?.[1] || "";
+      const src = buildUploadShortUrl(tag) || srcMatch?.[1] || "";
       if (src) {
         segments.push({
           type: "link",
@@ -132,16 +133,32 @@ function extractImageTitle(fullATag, innerHtml) {
 }
 
 /**
- * Extract the src attribute from the first <img> tag inside a link's inner HTML.
- * For lightbox images this is the thumbnail URL, as opposed to the <a> href
- * which points to the original.
+ * Build a Discourse short-upload URL from an <img> tag's data-base62-sha1
+ * and the file extension from its src attribute.
  *
- * @param {string} innerHtml
- * @returns {string|null}
+ * Discourse resolves upload://<sha1>.<ext> to the appropriate thumbnail /
+ * original automatically, and the link is portable across instances.
+ *
+ * @param {string} imgTag - the raw <img ...> HTML string
+ * @returns {string|null}  e.g. "upload://x0zfA900hmgChpPPlYmsc1mSyvM.jpeg"
  */
-function extractImgSrc(innerHtml) {
-  const srcMatch = /<img[^>]*src="([^"]*)"[^>]*>/i.exec(innerHtml);
-  return srcMatch ? srcMatch[1] : null;
+function buildUploadShortUrl(imgTag) {
+  const sha1Match = /data-base62-sha1="([^"]*)"[^>]*/i.exec(imgTag);
+  if (!sha1Match?.[1]) {
+    return null;
+  }
+  const sha1 = sha1Match[1];
+
+  const srcMatch = /src="([^"]*)"[^>]*/i.exec(imgTag);
+  if (!srcMatch?.[1]) {
+    return null;
+  }
+
+  // Pick the last dot-extension before any ? or # or end-of-string
+  const extMatch = /\.(\w+)(?:[?#]|$)/i.exec(srcMatch[1]);
+  const ext = extMatch?.[1]?.toLowerCase() || "";
+
+  return ext ? "upload://" + sha1 + "." + ext : "upload://" + sha1;
 }
 
 // ── Visual-width helpers (double-width Unicode) ───────────────────────────
@@ -194,7 +211,7 @@ function sliceByVisualWidth(text, maxWidth) {
  *
  * @returns {{ prefix: string, suffix: string, segments: (TextSegment|LinkSegment)[] }}
  */
-function parseHtmlToSegments(bbcodeString, keepImage, useThumbnail) {
+function parseHtmlToSegments(bbcodeString, keepImage) {
   const contentStart = bbcodeString.indexOf("]\n") + 2;
   const contentEnd = bbcodeString.length - 11; // "\n[/quote]".length
 
@@ -221,12 +238,11 @@ function parseHtmlToSegments(bbcodeString, keepImage, useThumbnail) {
     const innerHtml = match[2];
 
     if (keepImage && linkContainsNonEmojiImage(innerHtml)) {
-      // Image wrapped in a link (lightbox / onebox / manual) —
-      // preserve as a structured image so it can be output as ![title](url).
-      // When useThumbnail is on, prefer the <img src> (thumbnail) over the
-      // <a href> (original); otherwise keep the original.
-      const imgSrc = useThumbnail ? extractImgSrc(innerHtml) : null;
-      const imageHref = imgSrc || href;
+      // Image wrapped in a link (lightbox / onebox / manual).
+      // Prefer the short upload:// URL so Discourse handles thumbnail
+      // resolution; fall back to the <a> href if the img lacks
+      // data-base62-sha1 (e.g. external hotlinked images).
+      const imageHref = buildUploadShortUrl(innerHtml) || href;
       segments.push({
         type: "link",
         text: extractImageTitle(match[0], innerHtml),
@@ -446,8 +462,7 @@ function processQuoteWithSegments(bbcodeString, settings) {
   // Parse into structured segments (links are always preserved as objects)
   let { prefix, suffix, segments } = parseHtmlToSegments(
     text,
-    settings.quick_quote_keep_image,
-    settings.quick_quote_image_use_thumbnail
+    settings.quick_quote_keep_image
   );
 
   const doubleWidth = settings.quick_quote_double_width_unicode;
