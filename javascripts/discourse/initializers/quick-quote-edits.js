@@ -12,15 +12,22 @@ import Composer from "discourse/models/composer";
  * @property {"text"} type
  * @property {string} text
  *
+ * @typedef {Object} EmojiSegment
+ * @property {"emoji"} type
+ * @property {string} text   - raw emoji code from alt attribute (e.g. :wave:)
+ *
  * @typedef {Object} LinkSegment
  * @property {"link"} type
- * @property {string} text   - display text (textContent of <a>)
+ * @property {string} text   - display text
  * @property {string} href   - full URL
  * @property {boolean} isBareLink - text === href
+ * @property {boolean} [isImage]  - link wraps a non-emoji <img>
  */
 
 /**
  * Strip HTML tags and normalise whitespace from a raw HTML fragment.
+ * Does NOT handle emoji <img> tags — those should be extracted by
+ * parseInlineContent before this function is called on the remaining HTML.
  */
 function extractTextFromHtml(html) {
   const text = html
@@ -28,6 +35,100 @@ function extractTextFromHtml(html) {
     .replace(/\s+/g, " ")
     .trim();
   return text;
+}
+
+/**
+ * Parse an inline HTML fragment into structured segments.
+ *
+ * - Emoji (<img class="...emoji..." alt=":code:">) → EmojiSegment (width = 1).
+ * - Other <img> (standalone, not wrapped in <a>) → image segment when
+ *   keepImage is true (width = imageWidth, all-or-nothing).  When keepImage
+ *   is false they are silently dropped.
+ * - Everything else is stripped of HTML → TextSegment.
+ *
+ * @param {string} html
+ * @param {boolean} keepImage
+ * @returns {(TextSegment|EmojiSegment|LinkSegment)[]}
+ */
+function parseInlineContent(html, keepImage) {
+  const segments = [];
+  const imgRegex = /<img\b[^>]*>/gi;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = imgRegex.exec(html)) !== null) {
+    // Plain HTML before this <img>
+    if (match.index > lastIndex) {
+      const text = extractTextFromHtml(html.slice(lastIndex, match.index));
+      if (text) {
+        segments.push({ type: "text", text });
+      }
+    }
+
+    const tag = match[0];
+    if (/class="[^"]*emoji[^"]*"/i.test(tag)) {
+      const altMatch = /alt="([^"]*)"[^>]*/i.exec(tag);
+      segments.push({ type: "emoji", text: altMatch ? altMatch[1] : "" });
+    } else if (keepImage) {
+      // Standalone <img> not wrapped in <a> — preserve as image
+      const altMatch = /alt="([^"]*)"[^>]*/i.exec(tag);
+      const srcMatch = /src="([^"]*)"[^>]*/i.exec(tag);
+      const alt = altMatch?.[1]?.trim() || "image";
+      const src = srcMatch?.[1] || "";
+      if (src) {
+        segments.push({
+          type: "link",
+          text: alt,
+          href: src,
+          isBareLink: false,
+          isImage: true,
+        });
+      }
+    }
+    // When keepImage is false, non-emoji <img> is silently dropped.
+
+    lastIndex = match.index + match[0].length;
+  }
+
+  // Remaining text after the last <img>
+  if (lastIndex < html.length) {
+    const text = extractTextFromHtml(html.slice(lastIndex));
+    if (text) {
+      segments.push({ type: "text", text });
+    }
+  }
+
+  return segments;
+}
+
+// ── Image detection helpers ───────────────────────────────────────────────
+
+/**
+ * Check whether a link's inner HTML contains an <img> that is NOT an emoji.
+ * Discourse lightbox/onebox images are always wrapped in <a>, and we want to
+ * exclude inline emoji images (which also live inside <a> tags).
+ */
+function linkContainsNonEmojiImage(innerHtml) {
+  return (
+    /<img\b[^>]*>/i.test(innerHtml) &&
+    !/class="[^"]*emoji[^"]*"/i.test(innerHtml)
+  );
+}
+
+/**
+ * Extract a human-readable title for the image markdown.
+ * Priority: <img alt>  >  <a title>  >  "image" (fallback)
+ */
+function extractImageTitle(fullATag, innerHtml) {
+  const altMatch = /<img[^>]*alt="([^"]*)"[^>]*>/i.exec(innerHtml);
+  if (altMatch?.[1]?.trim()) {
+    return altMatch[1].trim();
+  }
+  const titleMatch = /title="([^"]*)"[^>]*>/i.exec(fullATag);
+  if (titleMatch?.[1]?.trim()) {
+    return titleMatch[1].trim();
+  }
+  return "image";
 }
 
 // ── Visual-width helpers (double-width Unicode) ───────────────────────────
@@ -80,7 +181,7 @@ function sliceByVisualWidth(text, maxWidth) {
  *
  * @returns {{ prefix: string, suffix: string, segments: (TextSegment|LinkSegment)[] }}
  */
-function parseHtmlToSegments(bbcodeString) {
+function parseHtmlToSegments(bbcodeString, keepImage) {
   const contentStart = bbcodeString.indexOf("]\n") + 2;
   const contentEnd = bbcodeString.length - 11; // "\n[/quote]".length
 
@@ -94,40 +195,54 @@ function parseHtmlToSegments(bbcodeString) {
   let match;
 
   while ((match = linkRegex.exec(htmlContent)) !== null) {
-    // Plain text before this link
+    // Plain text before this link — may produce text + emoji segments
     if (match.index > lastIndex) {
-      const beforeText = extractTextFromHtml(
-        htmlContent.slice(lastIndex, match.index)
+      const beforeSegments = parseInlineContent(
+        htmlContent.slice(lastIndex, match.index),
+        keepImage
       );
-      if (beforeText) {
-        segments.push({ type: "text", text: beforeText });
-      }
+      segments.push(...beforeSegments);
     }
 
     const href = match[1];
     const innerHtml = match[2];
-    const displayText = extractTextFromHtml(innerHtml);
 
-    if (displayText) {
-      const isBareLink =
-        displayText.toLowerCase() === href.trim().toLowerCase();
+    if (keepImage && linkContainsNonEmojiImage(innerHtml)) {
+      // Image wrapped in a link (lightbox / onebox / manual) —
+      // preserve as a structured image so it can be output as ![title](url)
       segments.push({
         type: "link",
-        text: displayText,
+        text: extractImageTitle(match[0], innerHtml),
         href,
-        isBareLink,
+        isBareLink: false,
+        isImage: true,
       });
+    } else {
+      // Regular link — flatten inline content to display text.
+      // Emoji inside a link contribute their raw alt text (e.g. :wave:)
+      // and count toward the display string as literal characters.
+      const innerSegments = parseInlineContent(innerHtml, keepImage);
+      const displayText = innerSegments.map((s) => s.text).join("");
+
+      if (displayText) {
+        const isBareLink =
+          displayText.toLowerCase() === href.trim().toLowerCase();
+        segments.push({
+          type: "link",
+          text: displayText,
+          href,
+          isBareLink,
+        });
+      }
     }
 
     lastIndex = linkRegex.lastIndex;
   }
 
-  // Remaining text after the last link
+  // Remaining text after the last link — may produce text + emoji segments
   if (lastIndex < htmlContent.length) {
-    const afterText = extractTextFromHtml(htmlContent.slice(lastIndex));
-    if (afterText) {
-      segments.push({ type: "text", text: afterText });
-    }
+    const afterSegments = parseInlineContent(htmlContent.slice(lastIndex), keepImage);
+    segments.push(...afterSegments);
   }
 
   return { prefix, suffix, segments };
@@ -174,8 +289,14 @@ function proactivelyTruncateBareLinks(segments) {
  * Total number of display characters across all segments.
  * Only display text counts — link hrefs are NOT counted.
  */
-function computeSegmentsDisplayLength(segments, doubleWidth) {
+function computeSegmentsDisplayLength(segments, doubleWidth, imageWidth) {
   return segments.reduce((total, seg) => {
+    if (seg.type === "emoji") {
+      return total + 1; // emoji always counts as 1 character
+    }
+    if (seg.isImage) {
+      return total + imageWidth;
+    }
     const w = doubleWidth ? visualWidth(seg.text) : seg.text.length;
     return total + w;
   }, 0);
@@ -189,7 +310,7 @@ function computeSegmentsDisplayLength(segments, doubleWidth) {
  * When doubleWidth is true, CJK / fullwidth characters count as 2 so that
  * mixed Chinese-English text has a more consistent visual cut point.
  */
-function truncateSegments(segments, charLimit, doubleWidth) {
+function truncateSegments(segments, charLimit, doubleWidth, imageWidth) {
   const result = [];
   let accumulated = 0;
 
@@ -197,6 +318,25 @@ function truncateSegments(segments, charLimit, doubleWidth) {
     const remaining = charLimit - accumulated;
     if (remaining <= 0) {
       break;
+    }
+
+    if (seg.type === "emoji") {
+      // Emoji are all-or-nothing with width 1.
+      if (accumulated + 1 <= charLimit) {
+        result.push(seg);
+        accumulated += 1;
+      }
+      continue;
+    }
+
+    if (seg.isImage) {
+      // Images are all-or-nothing: keep whole if the fixed width fits,
+      // otherwise drop entirely (no partial image markdown).
+      if (accumulated + imageWidth <= charLimit) {
+        result.push(seg);
+        accumulated += imageWidth;
+      }
+      continue;
     }
 
     const segWidth = doubleWidth ? visualWidth(seg.text) : seg.text.length;
@@ -259,8 +399,14 @@ function truncateSegments(segments, charLimit, doubleWidth) {
 function segmentsToContent(segments) {
   return segments
     .map((seg) => {
+      if (seg.type === "emoji") {
+        return seg.text;
+      }
       if (seg.type === "text") {
         return seg.text;
+      }
+      if (seg.isImage) {
+        return "![" + seg.text + "](" + seg.href + ")";
       }
       // link
       return "[" + seg.text + "](" + seg.href + ")";
@@ -281,9 +427,13 @@ function processQuoteWithSegments(bbcodeString, settings) {
   let text = bbcodeString.replace(/<aside[\s\S]*<\/aside>/g, "");
 
   // Parse into structured segments (links are always preserved as objects)
-  let { prefix, suffix, segments } = parseHtmlToSegments(text);
+  let { prefix, suffix, segments } = parseHtmlToSegments(
+    text,
+    settings.quick_quote_keep_image
+  );
 
   const doubleWidth = settings.quick_quote_double_width_unicode;
+  const imageWidth = settings.quick_quote_image_character_width;
 
   // Bare-link truncation requires keep_link_reachable to be ON first
   if (
@@ -295,14 +445,15 @@ function processQuoteWithSegments(bbcodeString, settings) {
 
   // Character limit
   if (settings.quick_quote_character_limit) {
-    const displayLength = computeSegmentsDisplayLength(segments, doubleWidth);
+    const displayLength = computeSegmentsDisplayLength(segments, doubleWidth, imageWidth);
     if (displayLength > settings.quick_quote_character_limit) {
       if (settings.quick_quote_keep_link_reachable) {
         // Smart truncation: only shorten display text, keep hrefs intact
         segments = truncateSegments(
           segments,
           settings.quick_quote_character_limit,
-          doubleWidth
+          doubleWidth,
+          imageWidth
         );
       } else {
         // Blunt truncation: flatten everything to plain text, then cut

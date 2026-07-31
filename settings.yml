@@ -28,3 +28,15 @@ quick_quote_double_width_unicode:
   description:
     en: "Count non-ASCII characters as double-width when truncating, so mixed-language text has a consistent visual cut point."
     zh_CN: "截断时将非 ASCII 字符计为 2 倍宽度，使中英文混排时截断后的视觉长度更加接近。"
+quick_quote_keep_image:
+  type: bool
+  default: true
+  description:
+    en: "Preserve images in quotes, output as ![title](url) Markdown. Applies to all images except emoji (which are always preserved as raw text)."
+    zh_CN: "在引用中保留图片，输出为 ![title](url) Markdown 格式。适用于所有非 emoji 图片（emoji 始终保留为原始文本）。"
+quick_quote_image_character_width:
+  type: integer
+  default: 40
+  description:
+    en: "Fixed number of characters an image occupies in the quote character budget. Images are kept whole or dropped entirely — no partial truncation."
+    zh_CN: "图片在引用字符限制中占用的固定宽度。图片要么完整保留，要么被整体丢弃——不会有部分截断。"
