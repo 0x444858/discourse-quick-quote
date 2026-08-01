@@ -325,7 +325,7 @@ function proactivelyTruncateBareLinks(segments) {
 function computeSegmentsDisplayLength(segments, doubleWidth, imageWidth) {
   return segments.reduce((total, seg) => {
     if (seg.type === "emoji") {
-      return total + 1; // emoji always counts as 1 character
+      return total + 2; // emoji visual width ≈ 2 ASCII chars
     }
     if (seg.isImage) {
       return total + imageWidth;
@@ -354,10 +354,10 @@ function truncateSegments(segments, charLimit, doubleWidth, imageWidth) {
     }
 
     if (seg.type === "emoji") {
-      // Emoji are all-or-nothing with width 1.
-      if (accumulated + 1 <= charLimit) {
+      // Emoji are all-or-nothing with width 2 (visual width ≈ 2 ASCII chars).
+      if (accumulated + 2 <= charLimit) {
         result.push(seg);
-        accumulated += 1;
+        accumulated += 2;
       }
       continue;
     }
