@@ -51,15 +51,26 @@ function extractTextFromHtml(html) {
  * @returns {(TextSegment|EmojiSegment|LinkSegment)[]}
  */
 function parseInlineContent(html, keepImage) {
+  // Step 1 — extract inline spoiler <span> wrappers so the inner content
+  //          is still parsed for emoji / images but the spoiler boundary
+  //          is tracked as a structured segment.
+  const { processedHtml, spoilerBlocks } = extractInlineSpoilers(
+    html,
+    keepImage
+  );
+
+  // Step 2 — parse the remaining HTML (with placeholders) for <img> tags
   const segments = [];
   const imgRegex = /<img\b[^>]*>/gi;
   let lastIndex = 0;
   let match;
 
-  while ((match = imgRegex.exec(html)) !== null) {
+  while ((match = imgRegex.exec(processedHtml)) !== null) {
     // Plain HTML before this <img>
     if (match.index > lastIndex) {
-      const text = extractTextFromHtml(html.slice(lastIndex, match.index));
+      const text = extractTextFromHtml(
+        processedHtml.slice(lastIndex, match.index)
+      );
       if (text) {
         segments.push({ type: "text", text });
       }
@@ -71,7 +82,6 @@ function parseInlineContent(html, keepImage) {
       segments.push({ type: "emoji", text: altMatch ? altMatch[1] : "" });
     } else if (keepImage) {
       // Standalone <img> not wrapped in <a> — preserve as image.
-      // Prefer the short upload:// URL when available.
       const altMatch = /alt="([^"]*)"[^>]*/i.exec(tag);
       const srcMatch = /src="([^"]*)"[^>]*/i.exec(tag);
       const alt = altMatch?.[1]?.trim() || "image";
@@ -92,14 +102,15 @@ function parseInlineContent(html, keepImage) {
   }
 
   // Remaining text after the last <img>
-  if (lastIndex < html.length) {
-    const text = extractTextFromHtml(html.slice(lastIndex));
+  if (lastIndex < processedHtml.length) {
+    const text = extractTextFromHtml(processedHtml.slice(lastIndex));
     if (text) {
       segments.push({ type: "text", text });
     }
   }
 
-  return segments;
+  // Step 3 — replace placeholder text segments with real spoiler segments
+  return injectSpoilerSegments(segments, spoilerBlocks);
 }
 
 // ── Image detection helpers ───────────────────────────────────────────────
@@ -205,30 +216,186 @@ function sliceByVisualWidth(text, maxWidth) {
   return text.slice(0, i);
 }
 
+// ── Spoiler helpers ─────────────────────────────────────────────────────────
+// Spoiler HTML wrappers are extracted BEFORE the main parsing pass so the
+// inner content is still processed for links / images / emoji, but the
+// spoiler boundary is tracked as a structured segment.  This lets truncation
+// keep the [spoiler]…[/spoiler] BBCode wrapper intact.
+
+const SPOILER_PLACEHOLDER_PREFIX = "\x01SPOILER_";
+const SPOILER_PLACEHOLDER_SUFFIX = "\x01";
+
 /**
- * Parse a buildQuote BBCode string into prefix, suffix, and an array of
- * structured segments.
- *
- * @returns {{ prefix: string, suffix: string, segments: (TextSegment|LinkSegment)[] }}
+ * Find every top-level <div class="spoiled …">…</div> block in *html*,
+ * replace each with a text placeholder, and recursively parse the inner
+ * HTML.  Returns the processed HTML and the collected spoiler-block
+ * descriptors so {@link injectSpoilerSegments} can re-insert them later.
  */
-function parseHtmlToSegments(bbcodeString, keepImage) {
-  const contentStart = bbcodeString.indexOf("]\n") + 2;
-  const contentEnd = bbcodeString.length - 11; // "\n[/quote]".length
+function extractBlockSpoilers(html, keepImage) {
+  const spoilerStartRe =
+    /<div\b[^>]*\bclass="[^"]*\b(?:spoiler|spoiled)\b[^"]*"[^>]*>/gi;
 
-  const prefix = bbcodeString.substring(0, contentStart);
-  const suffix = bbcodeString.substring(contentEnd);
-  const htmlContent = bbcodeString.substring(contentStart, contentEnd);
+  const blocks = [];
+  let output = "";
+  let lastIndex = 0;
+  let counter = 0;
+  let match;
 
+  while ((match = spoilerStartRe.exec(html)) !== null) {
+    output += html.slice(lastIndex, match.index);
+
+    // Count <div> / </div> depth to find the matching closing tag
+    let depth = 1;
+    let searchPos = match.index + match[0].length;
+    const divTagRe = /<div\b[^>]*>|<\/div>/gi;
+    let found = false;
+
+    while (depth > 0 && searchPos < html.length) {
+      divTagRe.lastIndex = searchPos;
+      const tagMatch = divTagRe.exec(html);
+
+      if (!tagMatch) {
+        break; // malformed HTML — give up
+      }
+
+      if (tagMatch[0].startsWith("</div")) {
+        depth--;
+        if (depth === 0) {
+          const innerHtml = html.slice(
+            match.index + match[0].length,
+            tagMatch.index
+          );
+          // Recursively parse inner content (may itself contain spoilers)
+          const innerSegments = parseHtmlContent(innerHtml, keepImage);
+          const placeholder =
+            SPOILER_PLACEHOLDER_PREFIX + counter + SPOILER_PLACEHOLDER_SUFFIX;
+          blocks.push({ placeholder, segments: innerSegments });
+          output += placeholder;
+          found = true;
+        }
+      } else {
+        depth++;
+      }
+
+      searchPos = tagMatch.index + tagMatch[0].length;
+    }
+
+    if (!found) {
+      // Couldn't find matching </div> — keep the original text unchanged
+      output += html.slice(match.index, searchPos);
+    }
+
+    lastIndex = searchPos;
+    // Prevent re-scanning already-consumed nested spoilers
+    spoilerStartRe.lastIndex = searchPos;
+    counter++;
+  }
+
+  output += html.slice(lastIndex);
+  return { processedHtml: output, spoilerBlocks: blocks };
+}
+
+/**
+ * Replace inline <span class="spoiler">…</span> wrappers with text
+ * placeholders.  Inline spoilers cannot nest, so a simple regex suffices.
+ */
+function extractInlineSpoilers(html, keepImage) {
+  const blocks = [];
+  let counter = 0;
+
+  const processedHtml = html.replace(
+    /<span\b[^>]*\bclass="[^"]*\b(?:spoiler|spoiled)\b[^"]*"[^>]*>([\s\S]*?)<\/span>/gi,
+    (_match, innerHtml) => {
+      const placeholder =
+        SPOILER_PLACEHOLDER_PREFIX + counter + SPOILER_PLACEHOLDER_SUFFIX;
+      const innerSegments = parseInlineContent(innerHtml, keepImage);
+      blocks.push({ placeholder, segments: innerSegments });
+      counter++;
+      return placeholder;
+    }
+  );
+
+  return { processedHtml, spoilerBlocks: blocks };
+}
+
+/**
+ * Walk through *segments* and replace every text segment whose content
+ * matches a spoiler placeholder with a `{ type: "spoiler", segments }`
+ * segment.  Placeholders are single-word tokens, so they survive
+ * `extractTextFromHtml` intact.
+ */
+function injectSpoilerSegments(segments, spoilerBlocks) {
+  if (spoilerBlocks.length === 0) {
+    return segments;
+  }
+
+  const result = [];
+  for (const seg of segments) {
+    if (seg.type !== "text") {
+      result.push(seg);
+      continue;
+    }
+
+    let text = seg.text;
+    let found = false;
+
+    for (const block of spoilerBlocks) {
+      const idx = text.indexOf(block.placeholder);
+      if (idx < 0) {
+        continue;
+      }
+
+      found = true;
+      // Text before the placeholder
+      if (idx > 0) {
+        const before = text.substring(0, idx).trim();
+        if (before) {
+          result.push({ type: "text", text: before });
+        }
+      }
+
+      // The spoiler block itself
+      result.push({ type: "spoiler", segments: block.segments });
+
+      // Continue with text after the placeholder (may contain more
+      // placeholders)
+      text = text.substring(idx + block.placeholder.length);
+    }
+
+    if (found && text.trim()) {
+      result.push({ type: "text", text: text.trim() });
+    } else if (!found) {
+      result.push(seg);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Parse raw HTML (NO surrounding [quote]…[/quote] wrapper) into structured
+ * segments.  This is the core parsing routine — it extracts spoiler blocks
+ * and <a> links, leaving the remainder as text/emoji/image segments.
+ */
+function parseHtmlContent(html, keepImage) {
+  // Step 1 — extract block spoilers so their inner content is parsed
+  //          normally but the spoiler boundary is tracked.
+  const { processedHtml, spoilerBlocks } = extractBlockSpoilers(
+    html,
+    keepImage
+  );
+
+  // Step 2 — parse the remaining HTML (with placeholders) for links
   const segments = [];
   const linkRegex = /<a\b[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
   let lastIndex = 0;
   let match;
 
-  while ((match = linkRegex.exec(htmlContent)) !== null) {
+  while ((match = linkRegex.exec(processedHtml)) !== null) {
     // Plain text before this link — may produce text + emoji segments
     if (match.index > lastIndex) {
       const beforeSegments = parseInlineContent(
-        htmlContent.slice(lastIndex, match.index),
+        processedHtml.slice(lastIndex, match.index),
         keepImage
       );
       segments.push(...beforeSegments);
@@ -238,10 +405,6 @@ function parseHtmlToSegments(bbcodeString, keepImage) {
     const innerHtml = match[2];
 
     if (keepImage && linkContainsNonEmojiImage(innerHtml)) {
-      // Image wrapped in a link (lightbox / onebox / manual).
-      // Prefer the short upload:// URL so Discourse handles thumbnail
-      // resolution; fall back to the <a> href if the img lacks
-      // data-base62-sha1 (e.g. external hotlinked images).
       const imageHref = buildUploadShortUrl(innerHtml) || href;
       segments.push({
         type: "link",
@@ -251,9 +414,6 @@ function parseHtmlToSegments(bbcodeString, keepImage) {
         isImage: true,
       });
     } else {
-      // Regular link — flatten inline content to display text.
-      // Emoji inside a link contribute their raw alt text (e.g. :wave:)
-      // and count toward the display string as literal characters.
       const innerSegments = parseInlineContent(innerHtml, keepImage);
       const displayText = innerSegments.map((s) => s.text).join("");
 
@@ -272,12 +432,34 @@ function parseHtmlToSegments(bbcodeString, keepImage) {
     lastIndex = linkRegex.lastIndex;
   }
 
-  // Remaining text after the last link — may produce text + emoji segments
-  if (lastIndex < htmlContent.length) {
-    const afterSegments = parseInlineContent(htmlContent.slice(lastIndex), keepImage);
+  // Remaining text after the last link
+  if (lastIndex < processedHtml.length) {
+    const afterSegments = parseInlineContent(
+      processedHtml.slice(lastIndex),
+      keepImage
+    );
     segments.push(...afterSegments);
   }
 
+  // Step 3 — replace placeholder text segments with real spoiler segments
+  return injectSpoilerSegments(segments, spoilerBlocks);
+}
+
+/**
+ * Parse a buildQuote BBCode string into prefix, suffix, and an array of
+ * structured segments.
+ *
+ * @returns {{ prefix: string, suffix: string, segments: Array }}
+ */
+function parseHtmlToSegments(bbcodeString, keepImage) {
+  const contentStart = bbcodeString.indexOf("]\n") + 2;
+  const contentEnd = bbcodeString.lastIndexOf("\n[/quote]");
+
+  const prefix = bbcodeString.substring(0, contentStart);
+  const suffix = bbcodeString.substring(contentEnd);
+  const htmlContent = bbcodeString.substring(contentStart, contentEnd);
+
+  const segments = parseHtmlContent(htmlContent, keepImage);
   return { prefix, suffix, segments };
 }
 
@@ -327,6 +509,10 @@ function computeSegmentsDisplayLength(segments, doubleWidth, imageWidth) {
     if (seg.type === "emoji") {
       return total + 2; // emoji visual width ≈ 2 ASCII chars
     }
+    if (seg.type === "spoiler") {
+      // Spoiler BBCode wrapper adds no visual width — only count inner content.
+      return total + computeSegmentsDisplayLength(seg.segments, doubleWidth, imageWidth);
+    }
     if (seg.isImage) {
       return total + imageWidth;
     }
@@ -358,6 +544,39 @@ function truncateSegments(segments, charLimit, doubleWidth, imageWidth) {
       if (accumulated + 2 <= charLimit) {
         result.push(seg);
         accumulated += 2;
+      }
+      continue;
+    }
+
+    if (seg.type === "spoiler") {
+      // Spoiler segments keep their BBCode wrapper intact.
+      // Inner content is truncated if needed; the wrapper itself costs
+      // no display width.
+      const innerLen = computeSegmentsDisplayLength(
+        seg.segments,
+        doubleWidth,
+        imageWidth
+      );
+      if (innerLen <= remaining) {
+        // Entire spoiler fits
+        result.push(seg);
+        accumulated += innerLen;
+      } else {
+        // Spoiler too long — truncate inner content but keep the wrapper
+        const truncatedInner = truncateSegments(
+          seg.segments,
+          remaining,
+          doubleWidth,
+          imageWidth
+        );
+        if (truncatedInner.length > 0) {
+          result.push({ type: "spoiler", segments: truncatedInner });
+          accumulated += computeSegmentsDisplayLength(
+            truncatedInner,
+            doubleWidth,
+            imageWidth
+          );
+        }
       }
       continue;
     }
@@ -426,6 +645,66 @@ function truncateSegments(segments, charLimit, doubleWidth, imageWidth) {
 }
 
 /**
+ * Check whether a segment array (recursively) contains any user-uploaded
+ * image.  Emoji images (type "emoji") do NOT count.
+ */
+function containsUploadedImage(segments) {
+  return segments.some(
+    (s) => s.isImage || (s.type === "spoiler" && containsUploadedImage(s.segments))
+  );
+}
+
+/**
+ * Recursively split user-uploaded images out of spoiler blocks so each image
+ * gets its own [spoiler] wrapper.  This is required by the Discourse backend:
+ * image-only [spoiler] blocks must be separated from inline text by a newline
+ * for the blur to render correctly on the server side.
+ *
+ * Returns a new segment array with images extracted into dedicated spoiler
+ * blocks.
+ */
+function splitImagesFromSpoilers(segments) {
+  const result = [];
+  for (const seg of segments) {
+    if (seg.type !== "spoiler") {
+      result.push(seg);
+      continue;
+    }
+
+    // Partition inner segments: images vs everything else
+    const images = [];
+    const others = [];
+    for (const inner of seg.segments) {
+      if (inner.isImage) {
+        images.push(inner);
+      } else if (inner.type === "spoiler") {
+        // Recurse into nested spoilers, then split any images found
+        const processed = splitImagesFromSpoilers([inner]);
+        for (const p of processed) {
+          if (p.type === "spoiler" && p.segments.every((s) => s.isImage)) {
+            images.push(...p.segments);
+          } else {
+            others.push(p);
+          }
+        }
+      } else {
+        others.push(inner);
+      }
+    }
+
+    // Emit text-only spoiler (if any non-image content remains)
+    if (others.length > 0) {
+      result.push({ type: "spoiler", segments: others });
+    }
+    // Each image gets its own dedicated spoiler block
+    for (const img of images) {
+      result.push({ type: "spoiler", segments: [img] });
+    }
+  }
+  return result;
+}
+
+/**
  * Rebuild the final content string from segments.
  * Links are output as Markdown [text](url) so they stay clickable.
  */
@@ -438,11 +717,38 @@ function segmentsToContent(segments) {
       if (seg.type === "text") {
         return seg.text;
       }
+      if (seg.type === "spoiler") {
+        const inner = segmentsToContent(seg.segments);
+        // Image-only spoiler blocks must sit on their own line — the
+        // Discourse backend only renders the blur correctly when an
+        // image [spoiler] is separated from adjacent text by a newline.
+        if (containsUploadedImage(seg.segments)) {
+          return "\n[spoiler]" + inner + "[/spoiler]\n";
+        }
+        return "[spoiler]" + inner + "[/spoiler]";
+      }
       if (seg.isImage) {
         return "![" + seg.text + "](" + seg.href + ")";
       }
       // link
       return "[" + seg.text + "](" + seg.href + ")";
+    })
+    .join(" ")
+    .replace(/ ?\n ?/g, "\n")
+    .trim();
+}
+
+/**
+ * Flatten segments to plain text, preserving [spoiler] BBCode wrappers
+ * so that hidden content stays hidden even in the blunt-truncation path.
+ */
+function segmentsToFlatText(segments) {
+  return segments
+    .map((seg) => {
+      if (seg.type === "spoiler") {
+        return "[spoiler]" + segmentsToFlatText(seg.segments) + "[/spoiler]";
+      }
+      return seg.text;
     })
     .join(" ");
 }
@@ -459,7 +765,9 @@ function processQuoteWithSegments(bbcodeString, settings) {
   // Always strip nested quotes first
   let text = bbcodeString.replace(/<aside[\s\S]*<\/aside>/g, "");
 
-  // Parse into structured segments (links are always preserved as objects)
+  // Parse into structured segments.
+  // Spoiler blocks are detected here and become { type: "spoiler", segments }
+  // so they survive truncation with the [spoiler]…[/spoiler] wrapper intact.
   let { prefix, suffix, segments } = parseHtmlToSegments(
     text,
     settings.quick_quote_keep_image
@@ -481,7 +789,8 @@ function processQuoteWithSegments(bbcodeString, settings) {
     const displayLength = computeSegmentsDisplayLength(segments, doubleWidth, imageWidth);
     if (displayLength > settings.quick_quote_character_limit) {
       if (settings.quick_quote_keep_link_reachable) {
-        // Smart truncation: only shorten display text, keep hrefs intact
+        // Smart truncation: only shorten display text, keep hrefs intact.
+        // Spoiler wrappers are preserved, inner content is truncated.
         segments = truncateSegments(
           segments,
           settings.quick_quote_character_limit,
@@ -489,8 +798,9 @@ function processQuoteWithSegments(bbcodeString, settings) {
           imageWidth
         );
       } else {
-        // Blunt truncation: flatten everything to plain text, then cut
-        const flatText = segments.map((seg) => seg.text).join(" ");
+        // Blunt truncation: flatten to text (preserving [spoiler] BBCode),
+        // then cut by visual width.
+        const flatText = segmentsToFlatText(segments);
         const excerpt = doubleWidth
           ? sliceByVisualWidth(flatText, settings.quick_quote_character_limit)
           : flatText.substring(0, settings.quick_quote_character_limit);
@@ -499,14 +809,23 @@ function processQuoteWithSegments(bbcodeString, settings) {
     }
   }
 
+  // Split user-uploaded images out of spoiler blocks so each image gets
+  // its own [spoiler] on its own line.  The Discourse backend only renders
+  // the blur correctly when an image [spoiler] is separated from adjacent
+  // text by a newline.
+  if (settings.quick_quote_keep_image) {
+    segments = splitImagesFromSpoilers(segments);
+  }
+
   // Reconstruct
   let content;
   if (settings.quick_quote_keep_link_reachable) {
-    // Links as [text](url) so they stay clickable
+    // Links as [text](url) so they stay clickable.
+    // Spoilers as [spoiler]…[/spoiler] BBCode.
     content = segmentsToContent(segments);
   } else {
-    // Plain text only — no Markdown link syntax
-    content = segments.map((seg) => seg.text).join(" ");
+    // Plain text only — no Markdown link syntax, but spoiler BBCode kept.
+    content = segmentsToFlatText(segments);
   }
 
   return prefix + content + suffix;
