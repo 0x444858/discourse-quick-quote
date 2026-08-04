@@ -22,6 +22,15 @@ import Composer from "discourse/models/composer";
  * @property {string} href   - full URL
  * @property {boolean} isBareLink - text === href
  * @property {boolean} [isImage]  - link wraps a non-emoji <img>
+ *
+ * @typedef {Object} InlineCodeSegment
+ * @property {"inlineCode"} type
+ * @property {string} text   - inner code text (backticks NOT included)
+ *
+ * @typedef {Object} CodeBlockSegment
+ * @property {"codeBlock"} type
+ * @property {string} text   - code content with whitespace preserved
+ * @property {string|null} lang - language from data-code-wrap, or null
  */
 
 /**
@@ -54,12 +63,16 @@ function parseInlineContent(html, keepImage) {
   // Step 1 — extract inline spoiler <span> wrappers so the inner content
   //          is still parsed for emoji / images but the spoiler boundary
   //          is tracked as a structured segment.
-  const { processedHtml, spoilerBlocks } = extractInlineSpoilers(
+  const { processedHtml: html1, spoilerBlocks } = extractInlineSpoilers(
     html,
     keepImage
   );
 
-  // Step 2 — parse the remaining HTML (with placeholders) for <img> tags
+  // Step 2 — extract inline <code> tags so they survive tag-stripping
+  //          and can be wrapped with backticks in the output.
+  const { processedHtml, codeBlocks } = extractInlineCodes(html1);
+
+  // Step 3 — parse the remaining HTML (with placeholders) for <img> tags
   const segments = [];
   const imgRegex = /<img\b[^>]*>/gi;
   let lastIndex = 0;
@@ -109,8 +122,16 @@ function parseInlineContent(html, keepImage) {
     }
   }
 
-  // Step 3 — replace placeholder text segments with real spoiler segments
-  return injectSpoilerSegments(segments, spoilerBlocks);
+  // Step 4 — replace code placeholder text segments with real inlineCode
+  //          segments before spoiler injection (so code inside spoilers works).
+  const segmentsWithCodes = injectCodeSegments(
+    segments,
+    codeBlocks,
+    "inlineCode"
+  );
+
+  // Step 5 — replace placeholder text segments with real spoiler segments
+  return injectSpoilerSegments(segmentsWithCodes, spoilerBlocks);
 }
 
 // ── Image detection helpers ───────────────────────────────────────────────
@@ -170,6 +191,182 @@ function buildUploadShortUrl(imgTag) {
   const ext = extMatch?.[1]?.toLowerCase() || "";
 
   return ext ? "upload://" + sha1 + "." + ext : "upload://" + sha1;
+}
+
+// ── Code block helpers ──────────────────────────────────────────────────────
+
+/**
+ * Decode common HTML entities back to literal characters.
+ * Code content inside <code> is HTML-escaped (e.g. &lt; for <).
+ */
+function decodeHtmlEntities(text) {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&nbsp;/g, " ");
+}
+
+/**
+ * Strip syntax-highlighting <span> tags from code-block inner HTML and decode
+ * HTML entities so the output is plain text with whitespace preserved.
+ *
+ * Must be called on the innerHTML of a <code> tag inside <pre> so that
+ * newlines and spaces are already represented literally.
+ */
+function stripCodeSpans(html) {
+  return decodeHtmlEntities(
+    html
+      .replace(/<span\b[^>]*>/gi, "")
+      .replace(/<\/span>/gi, "")
+  );
+}
+
+const CODE_PLACEHOLDER_PREFIX = "\x01CODE_";
+const CODE_PLACEHOLDER_SUFFIX = "\x01";
+
+/**
+ * Extract block-level <pre><code>…</code></pre> blocks from HTML and replace
+ * each with a text placeholder.  The code content is obtained via innerHTML
+ * semantics (span tags stripped, entities decoded) so whitespace and newlines
+ * are preserved.
+ *
+ * @param {string} html
+ * @returns {{ processedHtml: string, codeBlocks: Array<{placeholder: string, text: string, lang: string|null}> }}
+ */
+function extractBlockCodes(html) {
+  const preRegex = /<pre\b([^>]*)>([\s\S]*?)<\/pre>/gi;
+  const blocks = [];
+  let output = "";
+  let lastIndex = 0;
+  let counter = 0;
+  let match;
+
+  while ((match = preRegex.exec(html)) !== null) {
+    output += html.slice(lastIndex, match.index);
+
+    const preAttrs = match[1];
+    const preContent = match[2];
+
+    // Extract data-code-wrap for the language marker
+    let lang = null;
+    const langMatch = /data-code-wrap="([^"]*)"/i.exec(preAttrs);
+    if (langMatch?.[1]) {
+      lang = langMatch[1];
+    }
+
+    // Find the <code> tag inside <pre> and extract its innerHTML
+    const codeMatch = /<code\b[^>]*>([\s\S]*?)<\/code>/i.exec(preContent);
+    if (codeMatch) {
+      const codeText = stripCodeSpans(codeMatch[1]);
+      const placeholder =
+        CODE_PLACEHOLDER_PREFIX + "B_" + counter + CODE_PLACEHOLDER_SUFFIX;
+      blocks.push({ placeholder, text: codeText, lang });
+      output += placeholder;
+    } else {
+      // No <code> found — keep the original <pre> unchanged
+      output += match[0];
+    }
+
+    lastIndex = match.index + match[0].length;
+    counter++;
+  }
+
+  output += html.slice(lastIndex);
+  return { processedHtml: output, codeBlocks: blocks };
+}
+
+/**
+ * Extract inline <code>…</code> tags (those NOT inside <pre>) from HTML and
+ * replace each with a text placeholder.
+ *
+ * Call this ONLY after block-level <pre> tags have already been extracted,
+ * otherwise <code> inside <pre> would be matched here too.
+ *
+ * @param {string} html
+ * @returns {{ processedHtml: string, codeBlocks: Array<{placeholder: string, text: string}> }}
+ */
+function extractInlineCodes(html) {
+  const codeRegex = /<code\b[^>]*>([\s\S]*?)<\/code>/gi;
+  const blocks = [];
+  let counter = 0;
+
+  const processedHtml = html.replace(codeRegex, (_match, innerHtml) => {
+    // Strip any stray HTML tags first (shouldn't be any in well-formed
+    // inline <code>), then decode HTML entities so that &lt; etc. are
+    // restored to their literal characters.
+    const text = decodeHtmlEntities(innerHtml.replace(/<[^>]*>/g, ""));
+    const placeholder =
+      CODE_PLACEHOLDER_PREFIX + "I_" + counter + CODE_PLACEHOLDER_SUFFIX;
+    blocks.push({ placeholder, text });
+    counter++;
+    return placeholder;
+  });
+
+  return { processedHtml, codeBlocks: blocks };
+}
+
+/**
+ * Walk through *segments* and replace text segments whose content matches a
+ * code placeholder with the corresponding `inlineCode` or `codeBlock` segment.
+ *
+ * @param {Array} segments
+ * @param {Array} codeBlocks  — array of { placeholder, text[, lang] }
+ * @param {"inlineCode"|"codeBlock"} type
+ * @returns {Array}
+ */
+function injectCodeSegments(segments, codeBlocks, type) {
+  if (codeBlocks.length === 0) {
+    return segments;
+  }
+
+  const result = [];
+  for (const seg of segments) {
+    if (seg.type !== "text") {
+      result.push(seg);
+      continue;
+    }
+
+    let text = seg.text;
+    let found = false;
+
+    for (const block of codeBlocks) {
+      const idx = text.indexOf(block.placeholder);
+      if (idx < 0) {
+        continue;
+      }
+
+      found = true;
+      // Text before the placeholder
+      if (idx > 0) {
+        const before = text.substring(0, idx).trim();
+        if (before) {
+          result.push({ type: "text", text: before });
+        }
+      }
+
+      // The code segment itself
+      if (type === "codeBlock") {
+        result.push({ type: "codeBlock", text: block.text, lang: block.lang });
+      } else {
+        result.push({ type: "inlineCode", text: block.text });
+      }
+
+      // Continue with text after the placeholder
+      text = text.substring(idx + block.placeholder.length);
+    }
+
+    if (found && text.trim()) {
+      result.push({ type: "text", text: text.trim() });
+    } else if (!found) {
+      result.push(seg);
+    }
+  }
+
+  return result;
 }
 
 // ── Visual-width helpers (double-width Unicode) ───────────────────────────
@@ -378,10 +575,15 @@ function injectSpoilerSegments(segments, spoilerBlocks) {
  * and <a> links, leaving the remainder as text/emoji/image segments.
  */
 function parseHtmlContent(html, keepImage) {
+  // Step 0 — extract block-level code blocks (<pre><code>) so their
+  //          inner content is preserved with whitespace intact and later
+  //          formatted with ``` fences.
+  const { processedHtml: htmlAfterCodes, codeBlocks } = extractBlockCodes(html);
+
   // Step 1 — extract block spoilers so their inner content is parsed
   //          normally but the spoiler boundary is tracked.
   const { processedHtml, spoilerBlocks } = extractBlockSpoilers(
-    html,
+    htmlAfterCodes,
     keepImage
   );
 
@@ -441,8 +643,15 @@ function parseHtmlContent(html, keepImage) {
     segments.push(...afterSegments);
   }
 
-  // Step 3 — replace placeholder text segments with real spoiler segments
-  return injectSpoilerSegments(segments, spoilerBlocks);
+  // Step 3 — replace code-block placeholder text segments with real segments
+  const segmentsWithCodes = injectCodeSegments(
+    segments,
+    codeBlocks,
+    "codeBlock"
+  );
+
+  // Step 4 — replace placeholder text segments with real spoiler segments
+  return injectSpoilerSegments(segmentsWithCodes, spoilerBlocks);
 }
 
 /**
@@ -513,6 +722,14 @@ function computeSegmentsDisplayLength(segments, doubleWidth, imageWidth) {
       // Spoiler BBCode wrapper adds no visual width — only count inner content.
       return total + computeSegmentsDisplayLength(seg.segments, doubleWidth, imageWidth);
     }
+    if (seg.type === "inlineCode") {
+      // Only count the inner text — backticks are not counted.
+      return total + (doubleWidth ? visualWidth(seg.text) : seg.text.length);
+    }
+    if (seg.type === "codeBlock") {
+      // Only count the code content — ``` fences and language marker are not counted.
+      return total + (doubleWidth ? visualWidth(seg.text) : seg.text.length);
+    }
     if (seg.isImage) {
       return total + imageWidth;
     }
@@ -529,7 +746,7 @@ function computeSegmentsDisplayLength(segments, doubleWidth, imageWidth) {
  * When doubleWidth is true, CJK / fullwidth characters count as 2 so that
  * mixed Chinese-English text has a more consistent visual cut point.
  */
-function truncateSegments(segments, charLimit, doubleWidth, imageWidth) {
+function truncateSegments(segments, charLimit, doubleWidth, imageWidth, codeBlockMinBudget) {
   const result = [];
   let accumulated = 0;
 
@@ -567,7 +784,8 @@ function truncateSegments(segments, charLimit, doubleWidth, imageWidth) {
           seg.segments,
           remaining,
           doubleWidth,
-          imageWidth
+          imageWidth,
+          codeBlockMinBudget
         );
         if (truncatedInner.length > 0) {
           result.push({ type: "spoiler", segments: truncatedInner });
@@ -577,6 +795,55 @@ function truncateSegments(segments, charLimit, doubleWidth, imageWidth) {
             imageWidth
           );
         }
+      }
+      continue;
+    }
+
+    if (seg.type === "codeBlock") {
+      // Block code: if remaining budget is below the configurable threshold,
+      // skip the entire block AND stop the quote here — no further content
+      // is included (break out of the truncation loop entirely).
+      // The ``` fences and language marker are never truncated — only the
+      // inner code content can be cut.
+      if (remaining < codeBlockMinBudget) {
+        break;
+      }
+      const segWidth = doubleWidth
+        ? visualWidth(seg.text)
+        : seg.text.length;
+      if (accumulated + segWidth <= charLimit) {
+        result.push(seg);
+        accumulated += segWidth;
+      } else {
+        const cutText = doubleWidth
+          ? sliceByVisualWidth(seg.text, remaining)
+          : seg.text.substring(0, remaining);
+        result.push({
+          type: "codeBlock",
+          text: cutText + "...",
+          lang: seg.lang,
+        });
+        accumulated = charLimit;
+      }
+      continue;
+    }
+
+    if (seg.type === "inlineCode") {
+      // Inline code: the wrapping backticks are not counted toward the
+      // display length — only the inner text matters.  When truncation
+      // happens the ending backtick is always preserved.
+      const segWidth = doubleWidth
+        ? visualWidth(seg.text)
+        : seg.text.length;
+      if (accumulated + segWidth <= charLimit) {
+        result.push(seg);
+        accumulated += segWidth;
+      } else {
+        const cutText = doubleWidth
+          ? sliceByVisualWidth(seg.text, remaining)
+          : seg.text.substring(0, remaining);
+        result.push({ type: "inlineCode", text: cutText + "..." });
+        accumulated = charLimit;
       }
       continue;
     }
@@ -717,6 +984,18 @@ function segmentsToContent(segments) {
       if (seg.type === "text") {
         return seg.text;
       }
+      if (seg.type === "inlineCode") {
+        // Inline code wrapped with backticks.  The backticks do not
+        // count toward the display length budget.
+        return "`" + seg.text + "`";
+      }
+      if (seg.type === "codeBlock") {
+        // Block code with ``` fences.  The opening fence and language
+        // marker sit on their own lines; code content follows; the
+        // closing fence sits on its own line.
+        const lang = seg.lang || "";
+        return "\n```" + lang + "\n" + seg.text + "\n```\n";
+      }
       if (seg.type === "spoiler") {
         const inner = segmentsToContent(seg.segments);
         // Image-only spoiler blocks must sit on their own line — the
@@ -747,6 +1026,13 @@ function segmentsToFlatText(segments) {
     .map((seg) => {
       if (seg.type === "spoiler") {
         return "[spoiler]" + segmentsToFlatText(seg.segments) + "[/spoiler]";
+      }
+      if (seg.type === "inlineCode") {
+        return "`" + seg.text + "`";
+      }
+      if (seg.type === "codeBlock") {
+        const lang = seg.lang || "";
+        return "\n```" + lang + "\n" + seg.text + "\n```\n";
       }
       return seg.text;
     })
@@ -795,7 +1081,8 @@ function processQuoteWithSegments(bbcodeString, settings) {
           segments,
           settings.quick_quote_character_limit,
           doubleWidth,
-          imageWidth
+          imageWidth,
+          settings.quick_quote_code_block_min_budget
         );
       } else {
         // Blunt truncation: flatten to text (preserving [spoiler] BBCode),

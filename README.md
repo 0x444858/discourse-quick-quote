@@ -16,6 +16,8 @@ A Discourse Theme Component that changes Post Reply buttons to automatically quo
 - **Emoji 保留**：内联 emoji（`:wave:` 等）始终保留为原始文本，计为 2 字符宽度（视觉宽度 ≈ 2 个 ASCII 字符）。
 - **双倍宽度 Unicode**：截断时将非 ASCII 字符（中文/CJK/全角符号等）计为 2 倍宽度，使中英文混排文本的截断视觉长度更均匀。
 - **Spoiler（模糊内容）保留**：引用中的模糊块（`<div class="spoiler">` / `<span class="spoiler">` 及其 `spoiled`、`spoiler-blurred` 等变体）自动转换为 `[spoiler]…[/spoiler]` BBCode。截断时包装器始终完整，内部内容按需截断，不会出现 BBCode 残缺。
+- **行内代码保留**：行内代码（`<code>` 标签）自动以 `` ` `` 包裹。起止反引号不计入字符预算，截断仅发生在内部文本，结束反引号始终保留。
+- **块级代码保留**：块级代码（`<pre><code>` 标签）自动以 ```` ```lang ```` 围栏格式化。围栏标记和语言标识不计入字符预算，截断仅发生在代码内容内部。语法高亮的 `<span>` 标签会被剥离，空白和换行完整保留。若前文消耗后剩余预算低于配置的阈值（默认 20 字符），则跳过整个块级代码块，且引用到此为止——后续内容不再纳入，以避免产生内容过少的残缺代码块。
 - **嵌套引用剥离**：自动移除引用中的嵌套 `<aside>` 引用块，防止内容膨胀。
 - **位置感知**：可配置距离最新回复多少层以内的帖子不触发截断，避免截断正在进行的讨论。
 
@@ -32,6 +34,7 @@ A Discourse Theme Component that changes Post Reply buttons to automatically quo
 | `quick_quote_double_width_unicode` | bool | `true` | 非 ASCII 字符计为双倍宽度 |
 | `quick_quote_keep_image` | bool | `true` | 在引用中保留图片 |
 | `quick_quote_image_character_width` | integer | `40` | 图片在字符预算中占用的固定宽度 |
+| `quick_quote_code_block_min_budget` | integer | `20` | 包含块级代码块所需的最小剩余字符预算。若剩余预算低于此值，块级代码块及其后所有内容均被丢弃，引用到此为止 |
 
 ---
 
@@ -42,40 +45,52 @@ A Discourse Theme Component that changes Post Reply buttons to automatically quo
   │
   ├─ 剥离嵌套引用 (<aside>...</aside>)
   │
+  ├─ 提取块级代码块（占位符保护）
+  │   └─ <pre data-code-wrap="lang"><code>…</code></pre>  →  \x01CODE_B_0\x01
+  │
   ├─ 提取 spoiler 块（占位符保护）
   │   ├─ 块级: <div class="spoiler|spoiled …">…</div>  →  \x01SPOILER_0\x01
   │   └─ 内联: <span class="spoiler|spoiled …">…</span>  →  \x01SPOILER_0\x01
   │
   ├─ 解析为结构化分段
-  │   ├─ TextSegment    — 纯文本
-  │   ├─ EmojiSegment   — emoji（宽度=2，全有或全无）
-  │   ├─ LinkSegment    — 链接/图片（只截文字，保留 href）
-  │   └─ SpoilerSegment — 模糊块（包装器不计宽度，内部递归截断）
+  │   ├─ TextSegment      — 纯文本
+  │   ├─ EmojiSegment     — emoji（宽度=2，全有或全无）
+  │   ├─ LinkSegment      — 链接/图片（只截文字，保留 href）
+  │   ├─ InlineCodeSegment  — 行内代码（反引号不计宽度，截断内部文本）
+  │   ├─ CodeBlockSegment   — 块级代码（围栏不计宽度，剩余预算<阈值则整体丢弃）
+  │   └─ SpoilerSegment   — 模糊块（包装器不计宽度，内部递归截断）
   │
-  ├─ 占位符注入: 将 \x01SPOILER_N\x01 文本段替换为 SpoilerSegment
+  ├─ 占位符注入: 将 \x01SPOILER_N\x01 / \x01CODE_N\x01 文本段
+  │   替换为对应的结构化分段
   │
   ├─ [可选] 裸链预截断
   │
   ├─ [可选] 字符限长截断
-  │   ├─ keep_link_reachable=true  → 智能截断（保护链接与 spoiler 包装器）
-  │   └─ keep_link_reachable=false → 笨拙截断（segmentsToFlatText 保留 [spoiler] 后 cut）
+  │   ├─ keep_link_reachable=true  → 智能截断（保护链接、spoiler、代码格式）
+  │   └─ keep_link_reachable=false → 笨拙截断（segmentsToFlatText 保留 BBCode 后 cut）
   │
   └─ 重建输出
-      ├─ keep_link_reachable=true  → segmentsToContent  (Markdown + [spoiler])
-      └─ keep_link_reachable=false → segmentsToFlatText (纯文本 + [spoiler])
+      ├─ keep_link_reachable=true  → segmentsToContent  (Markdown + BBCode)
+      └─ keep_link_reachable=false → segmentsToFlatText (纯文本 + BBCode)
 ```
 
 ### 占位符机制 / Placeholder System
 
-Spoiler 的 HTML 包装器必须在解析管道早期被提取，但在 HTML 标签剥离步骤 `extractTextFromHtml` 之后才能定位回原文位置。为此引入了一个**三步占位符模式**：
+Spoiler 与块级代码块的 HTML 包装器必须在解析管道早期被提取，但在 HTML 标签剥离步骤 `extractTextFromHtml` 之后才能定位回原文位置。为此引入了一个**三步占位符模式**，代码块与 spoiler 共用同一机制：
+
+| 占位符前缀 | 目标元素 | 提取函数 | 注入函数 |
+| ---------- | -------- | -------- | -------- |
+| `\x01CODE_B_N\x01` | `<pre><code>` 块级代码 | `extractBlockCodes` | `injectCodeSegments(type: "codeBlock")` |
+| `\x01CODE_I_N\x01` | `<code>` 行内代码 | `extractInlineCodes` | `injectCodeSegments(type: "inlineCode")` |
+| `\x01SPOILER_N\x01` | `<div/span class="spoiler…">` | `extractBlockSpoilers` / `extractInlineSpoilers` | `injectSpoilerSegments` |
+
+执行顺序：**先块级代码 → 再 spoiler → 再行内代码**，确保 `<code>` 在 `<pre>` 内部时不会被行内提取误匹配。
 
 | 步骤 | 函数 | 输入 | 输出 |
 | ---- | ---- | ---- | ---- |
-| **1. 提取** | `extractBlockSpoilers` / `extractInlineSpoilers` | `<div class="spoiler">隐藏内容</div>` | 占位符 `\x01SPOILER_0\x01` + 已解析的内部段 |
+| **1. 提取** | `extractBlockCodes` / `extractBlockSpoilers` / `extractInlineCodes` | `<pre data-code-wrap="js"><code>…</code></pre>` | 占位符 `\x01CODE_B_0\x01` + 已剥离 span 的纯文本 |
 | **2. 解析** | `parseHtmlContent` / `parseInlineContent` | 含占位符的普通文本 | 普通段 + 含占位符的 TextSegment |
-| **3. 注入** | `injectSpoilerSegments` | 含占位符的 TextSegment | SpoilerSegment（结构完整） |
-
-占位符格式：`` \x01SPOILER_N\x01 ``（`N` 为递增整数）
+| **3. 注入** | `injectCodeSegments` / `injectSpoilerSegments` | 含占位符的 TextSegment | CodeBlockSegment / InlineCodeSegment / SpoilerSegment（结构完整） |
 
 **选择 `\x01`（SOH 控制字符）的原因：**
 
@@ -83,7 +98,7 @@ Spoiler 的 HTML 包装器必须在解析管道早期被提取，但在 HTML 标
 - 不是空白字符 → `/\s+/` 合并和 `.trim()` 不会移除它
 - 不会在正常用户输入中出现 → 零误匹配
 
-整个模式等价于：**先用标记「占坑」保护 spoiler 边界 → 管道正常加工 → 最后用结构化段换回标记**。
+整个模式等价于：**先用标记「占坑」保护特殊结构边界 → 管道正常加工 → 最后用结构化段换回标记**。
 
 ---
 

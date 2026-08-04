@@ -40,3 +40,9 @@ quick_quote_image_character_width:
   description:
     en: "Fixed number of characters an image occupies in the quote character budget. Images are kept whole or dropped entirely — no partial truncation."
     zh_CN: "图片在引用字符限制中占用的固定宽度。图片要么完整保留，要么被整体丢弃——不会有部分截断。"
+quick_quote_code_block_min_budget:
+  type: integer
+  default: 20
+  description:
+    en: "Minimum remaining character budget required to include a block code block. If the remaining budget falls below this threshold, the block code block is dropped and the quote ends — no further content is included."
+    zh_CN: "包含块级代码块所需的最小剩余字符预算。块级代码块占用空间较大，若前文消耗后剩余预算低于此值，则跳过整个块级代码块，且引用到此为止，后续内容不再纳入。"
